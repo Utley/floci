@@ -46,7 +46,11 @@ import org.bouncycastle.jce.ECNamedCurveTable;
 import org.bouncycastle.jce.spec.ECNamedCurveParameterSpec;
 import org.jboss.logging.Logger;
 
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.Mac;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -55,7 +59,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.interfaces.EdECPrivateKey;
+import java.security.interfaces.RSAPrivateKey;
 import java.security.spec.ECGenParameterSpec;
+import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Instant;
@@ -795,8 +801,19 @@ public class KmsService implements ResourceProvider {
     }
 
     public byte[] encrypt(String keyId, byte[] plaintext, Map<String, String> encryptionContext, String region) {
+        return encrypt(keyId, plaintext, encryptionContext, null, region);
+    }
+
+    public byte[] encrypt(String keyId, byte[] plaintext, Map<String, String> encryptionContext,
+                          String encryptionAlgorithm, String region) {
         KmsKey kmsKey = resolveKey(keyId, region);
         validateKeyIsUsableForCryptoOperations(kmsKey);
+
+        if (KmsKeySpec.KeyType.RSA == kmsKey.getKeySpec().getKeyType()) {
+            String algorithm = resolveRsaEncryptionAlgorithm(kmsKey, encryptionAlgorithm);
+            return rsaEncrypt(kmsKey, plaintext, encryptionContext, algorithm);
+        }
+        validateSymmetricEncryptionAlgorithm(kmsKey, encryptionAlgorithm);
 
         byte[] nonceBytes = new byte[NONCE_BYTES];
         SECURE_RANDOM.nextBytes(nonceBytes);
@@ -815,16 +832,27 @@ public class KmsService implements ResourceProvider {
     }
 
     public byte[] decrypt(byte[] ciphertext, Map<String, String> encryptionContext, String region) {
-        ParsedBlob parsed = parseBlob(ciphertext);
-        if (!parsed.contextFingerprint.equals(contextFingerprint(encryptionContext))) {
-            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
-        }
-        return Base64.getDecoder().decode(parsed.payload);
+        return decryptAndResolveKey(ciphertext, encryptionContext, null, region, null).plaintext();
+    }
+
+    public byte[] decrypt(byte[] ciphertext, Map<String, String> encryptionContext,
+                          String encryptionAlgorithm, String region) {
+        return decrypt(ciphertext, encryptionContext, encryptionAlgorithm, null, region).plaintext();
+    }
+
+    private DecryptResult decrypt(byte[] ciphertext, Map<String, String> encryptionContext,
+                                  String encryptionAlgorithm, String requestKeyId, String region) {
+        return decryptAndResolveKey(ciphertext, encryptionContext, encryptionAlgorithm, region, requestKeyId);
     }
 
     public String decryptToKeyArn(byte[] ciphertext, String region) {
         try {
-            return resolveKey(parseBlob(ciphertext).keyId, region).getArn();
+            ParsedBlob parsed = tryParseBlob(ciphertext);
+            if (parsed != null) {
+                return resolveKey(parsed.keyId, region).getArn();
+            }
+            // Raw RSA ciphertext carries no key reference: find the key that unwraps it.
+            return rsaDecryptAndResolveKey(ciphertext, Map.of(), null, null, region).keyArn();
         } catch (AwsException e) {
             return null;
         }
@@ -840,37 +868,139 @@ public class KmsService implements ResourceProvider {
             String region,
             String requestKeyId
     ) {
-        ParsedBlob parsed = parseBlob(ciphertext);
-        if (!parsed.contextFingerprint.equals(contextFingerprint(encryptionContext))) {
-            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
-        }
-        byte[] plaintext = Base64.getDecoder().decode(parsed.payload);
+        return decryptAndResolveKey(ciphertext, encryptionContext, null, region, requestKeyId);
+    }
 
+    public DecryptResult decryptAndResolveKey(
+            byte[] ciphertext,
+            Map<String, String> encryptionContext,
+            String encryptionAlgorithm,
+            String region,
+            String requestKeyId
+    ) {
+        // Try the symmetric blob envelope first; anything else is treated as raw RSA
+        // OAEP ciphertext (Encrypt output for RSA keys, or the output of encrypting
+        // with the public key returned by GetPublicKey).
+        ParsedBlob parsed = tryParseBlob(ciphertext);
+
+        KmsKey key = null;
         if (requestKeyId != null && !requestKeyId.isBlank()) {
-            KmsKey requestKey = resolveKey(requestKeyId, region);
-            if (!requestKey.getKeyId().equals(parsed.keyId)) {
+            key = resolveKey(requestKeyId, region);
+            if (parsed != null && !key.getKeyId().equals(parsed.keyId)) {
                 throw new AwsException(
                         "IncorrectKeyException",
                         "The request was rejected because the specified KMS key cannot decrypt the data.",
                         400
                 );
             }
-            validateKeyIsUsableForCryptoOperations(requestKey);
-
-            return new DecryptResult(plaintext, requestKey.getArn());
+        } else if (parsed != null) {
+            try {
+                key = resolveKey(parsed.keyId, region);
+            } catch (AwsException e) {
+                key = null;
+            }
         }
 
-        KmsKey key;
-        try {
-            key = resolveKey(parsed.keyId, region);
-        } catch (AwsException e) {
-            key = null;
+        if (parsed == null) {
+            return rsaDecryptAndResolveKey(ciphertext, encryptionContext, encryptionAlgorithm, key, region);
         }
+        if (encryptionAlgorithm != null && !encryptionAlgorithm.isBlank()
+                && !"SYMMETRIC_DEFAULT".equals(encryptionAlgorithm)) {
+            throw new AwsException("InvalidEncryptionAlgorithmException",
+                    "The encryption algorithm " + encryptionAlgorithm + " is not compatible with the ciphertext.", 400);
+        }
+        if (!parsed.contextFingerprint.equals(contextFingerprint(encryptionContext))) {
+            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+        }
+        byte[] plaintext = Base64.getDecoder().decode(parsed.payload);
+
         if (key == null) {
+            // Blob parsed and context matched, but the key is gone (or was never resolvable):
+            // plaintext recovery still succeeds, only ARN resolution is skipped.
             return new DecryptResult(plaintext, null);
         }
         validateKeyIsUsableForCryptoOperations(key);
         return new DecryptResult(plaintext, key.getArn());
+    }
+
+    /**
+     * Decrypts a raw RSA OAEP ciphertext. When no candidate key was resolved (no KeyId
+     * on the request), every RSA ENCRYPT_DECRYPT key in the region is tried, matching
+     * the AWS flow where asymmetric ciphertexts carry no embedded key reference.
+     */
+    private DecryptResult rsaDecryptAndResolveKey(byte[] ciphertext, Map<String, String> encryptionContext,
+                                                  String encryptionAlgorithm, KmsKey candidate, String region) {
+        boolean keyPinned = candidate != null;
+        List<KmsKey> candidates;
+        if (keyPinned) {
+            validateRsaDecryptKey(candidate);
+            candidates = List.of(candidate);
+        } else {
+            candidates = listKeys(region).stream()
+                    .filter(k -> KmsKeySpec.KeyType.RSA == k.getKeySpec().getKeyType())
+                    .filter(k -> KmsKeyUsage.ENCRYPT_DECRYPT == k.getKeyUsage())
+                    .filter(k -> rsaModulusBytes(k) == ciphertext.length)
+                    .toList();
+        }
+
+        for (KmsKey key : candidates) {
+            String algorithm = encryptionAlgorithm;
+            if (algorithm == null || algorithm.isBlank()) {
+                // RSAES_OAEP_SHA_256 is the AWS default; fall back to SHA_1 so clients
+                // that omit EncryptionAlgorithm can still decrypt SHA_1 ciphertexts.
+                byte[] plaintext = tryRsaDecrypt(key, ciphertext, encryptionContext, "RSAES_OAEP_SHA_256");
+                if (plaintext == null) {
+                    plaintext = tryRsaDecrypt(key, ciphertext, encryptionContext, "RSAES_OAEP_SHA_1");
+                }
+                if (plaintext != null) {
+                    validateKeyIsUsableForCryptoOperations(key);
+                    return new DecryptResult(plaintext, key.getArn());
+                }
+                continue;
+            }
+            validateRsaEncryptionAlgorithm(algorithm);
+            byte[] plaintext = tryRsaDecrypt(key, ciphertext, encryptionContext, algorithm);
+            if (plaintext != null) {
+                validateKeyIsUsableForCryptoOperations(key);
+                return new DecryptResult(plaintext, key.getArn());
+            }
+            if (keyPinned) {
+                throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+            }
+        }
+        throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+    }
+
+    private void validateRsaDecryptKey(KmsKey key) {
+        if (KmsKeySpec.KeyType.RSA != key.getKeySpec().getKeyType()) {
+            throw new AwsException("IncorrectKeyException",
+                    "The request was rejected because the specified KMS key cannot decrypt the data.", 400);
+        }
+        if (KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "The key usage " + key.getKeyUsage() + " does not support decryption.", 400);
+        }
+    }
+
+    /** OAEP ciphertexts are exactly one modulus long, so mismatched keys can be skipped cheaply. */
+    private int rsaModulusBytes(KmsKey key) {
+        try {
+            PrivateKey privateKey = loadPrivateKey(key.getPrivateKeyEncoded(), key.getKeySpec());
+            return ((RSAPrivateKey) privateKey).getModulus().bitLength() / 8;
+        } catch (Exception e) {
+            LOG.debugv("Could not read RSA modulus for key {0}: {1}", key.getKeyId(), e.getMessage());
+            return -1;
+        }
+    }
+
+    private byte[] tryRsaDecrypt(KmsKey key, byte[] ciphertext, Map<String, String> encryptionContext,
+                                 String algorithm) {
+        try {
+            return rsaDecrypt(key, ciphertext, encryptionContext, algorithm);
+        } catch (AwsException e) {
+            LOG.debugv("RSA decrypt attempt failed for key {0}: {1}", key.getKeyId(), e.getMessage());
+            return null;
+        }
     }
 
     public record DecryptResult(byte[] plaintext, String keyArn) {}
@@ -880,6 +1010,19 @@ public class KmsService implements ResourceProvider {
     public record VerifyMacResult(String keyArn) {}
 
     private record ParsedBlob(String keyId, String nonce, String contextFingerprint, String payload) {}
+
+    /**
+     * Non-throwing variant used by decrypt: ciphertexts that are not floci blob envelopes
+     * (raw RSA OAEP output, whether produced by floci Encrypt or by an external client
+     * encrypting with the GetPublicKey public key) fall through to the RSA path.
+     */
+    private static ParsedBlob tryParseBlob(byte[] ciphertext) {
+        try {
+            return parseBlob(ciphertext);
+        } catch (AwsException e) {
+            return null;
+        }
+    }
 
     private static ParsedBlob parseBlob(byte[] ciphertext) {
         String data = new String(ciphertext, StandardCharsets.UTF_8);
@@ -900,6 +1043,144 @@ public class KmsService implements ResourceProvider {
             }
         }
         throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+    }
+
+    // ──────────────────────── Asymmetric (RSA OAEP) crypto ────────────────────────
+
+    private static final String RSA_TRANSFORMATION = "RSA/ECB/OAEPPadding";
+    private static final String RSAES_OAEP_SHA_1 = "RSAES_OAEP_SHA_1";
+    private static final String RSAES_OAEP_SHA_256 = "RSAES_OAEP_SHA_256";
+
+    private byte[] rsaEncrypt(KmsKey key, byte[] plaintext, Map<String, String> encryptionContext,
+                              String algorithm) {
+        try {
+            Cipher cipher = Cipher.getInstance(RSA_TRANSFORMATION);
+            cipher.init(Cipher.ENCRYPT_MODE,
+                    loadPublicKey(key.getPublicKeyEncoded(), key.getKeySpec()),
+                    oaepSpec(algorithm, encryptionContext));
+            return cipher.doFinal(plaintext);
+        } catch (AwsException e) {
+            throw e;
+        } catch (IllegalBlockSizeException e) {
+            throw new AwsException("ValidationException",
+                    "Plaintext exceeds the maximum size for " + key.getKeySpec()
+                            + " with " + algorithm + ".", 400);
+        } catch (Exception e) {
+            throw new AwsException("InternalFailure", "Failed to encrypt: " + e.getMessage(), 500);
+        }
+    }
+
+    private byte[] rsaDecrypt(KmsKey key, byte[] ciphertext, Map<String, String> encryptionContext,
+                              String algorithm) {
+        try {
+            Cipher cipher = Cipher.getInstance(RSA_TRANSFORMATION);
+            cipher.init(Cipher.DECRYPT_MODE,
+                    loadPrivateKey(key.getPrivateKeyEncoded(), key.getKeySpec()),
+                    oaepSpec(algorithm, encryptionContext));
+            return cipher.doFinal(ciphertext);
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            // OAEP unpadding failure covers wrong key, wrong hash, wrong label and
+            // corrupted ciphertext; AWS reports all of these as InvalidCiphertextException.
+            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+        }
+    }
+
+    /**
+     * AWS binds the EncryptionContext into RSA OAEP as the OAEP label, using an
+     * ASN.1 DER encoding of the context map (aws/aws-encryption-sdk RsaCipherHelper
+     * / kms-dh-secret DerivationInput format).
+     */
+    private OAEPParameterSpec oaepSpec(String algorithm, Map<String, String> encryptionContext) {
+        byte[] label = encryptionContext == null || encryptionContext.isEmpty()
+                ? new byte[0]
+                : derEncodeEncryptionContext(encryptionContext);
+        return switch (algorithm) {
+            case RSAES_OAEP_SHA_1 -> new OAEPParameterSpec(
+                    "SHA-1", "MGF1", MGF1ParameterSpec.SHA1, new PSource.PSpecified(label));
+            case RSAES_OAEP_SHA_256 -> new OAEPParameterSpec(
+                    "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, new PSource.PSpecified(label));
+            default -> throw new AwsException("InvalidEncryptionAlgorithmException",
+                    "Unsupported encryption algorithm: " + algorithm, 400);
+        };
+    }
+
+    private static byte[] derEncodeEncryptionContext(Map<String, String> encryptionContext) {
+        try {
+            TreeMap<String, String> sorted = new TreeMap<>(encryptionContext);
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            for (Map.Entry<String, String> entry : sorted.entrySet()) {
+                body.write(derLengthPrefixed(entry.getKey().getBytes(StandardCharsets.UTF_8)));
+                body.write(derLengthPrefixed(entry.getValue().getBytes(StandardCharsets.UTF_8)));
+            }
+            byte[] content = body.toByteArray();
+            ByteArrayOutputStream der = new ByteArrayOutputStream();
+            der.write(0x30); // ASN.1 SEQUENCE
+            der.write(derLength(content.length));
+            der.write(content);
+            return der.toByteArray();
+        } catch (IOException e) {
+            throw new AwsException("InternalFailure", "Failed to encode encryption context: " + e.getMessage(), 500);
+        }
+    }
+
+    private static byte[] derLengthPrefixed(byte[] value) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(derLength(value.length));
+        out.writeBytes(value);
+        return out.toByteArray();
+    }
+
+    private static byte[] derLength(int length) {
+        if (length < 128) {
+            return new byte[]{(byte) length};
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int value = length;
+        while (value > 0) {
+            out.write(value & 0xFF);
+            value >>>= 8;
+        }
+        byte[] reversed = out.toByteArray();
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        result.write(0x80 | reversed.length);
+        for (int i = reversed.length - 1; i >= 0; i--) {
+            result.write(reversed[i]);
+        }
+        return result.toByteArray();
+    }
+
+    private static String resolveRsaEncryptionAlgorithm(KmsKey key, String encryptionAlgorithm) {
+        if (KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "The key usage " + key.getKeyUsage() + " does not support encryption.", 400);
+        }
+        if (encryptionAlgorithm == null || encryptionAlgorithm.isBlank()) {
+            return RSAES_OAEP_SHA_256;
+        }
+        return validateRsaEncryptionAlgorithm(encryptionAlgorithm);
+    }
+
+    private static String validateRsaEncryptionAlgorithm(String encryptionAlgorithm) {
+        return switch (encryptionAlgorithm) {
+            case RSAES_OAEP_SHA_1, RSAES_OAEP_SHA_256 -> encryptionAlgorithm;
+            default -> throw new AwsException("InvalidEncryptionAlgorithmException",
+                    "The encryption algorithm " + encryptionAlgorithm + " is not compatible with the key spec.", 400);
+        };
+    }
+
+    private static void validateSymmetricEncryptionAlgorithm(KmsKey key, String encryptionAlgorithm) {
+        if (KmsKeyUsage.ENCRYPT_DECRYPT != key.getKeyUsage()) {
+            throw new AwsException("InvalidKeyUsageException",
+                    "The key usage " + key.getKeyUsage() + " does not support encryption.", 400);
+        }
+        if (encryptionAlgorithm != null && !encryptionAlgorithm.isBlank()
+                && !"SYMMETRIC_DEFAULT".equals(encryptionAlgorithm)) {
+            throw new AwsException("InvalidEncryptionAlgorithmException",
+                    "The encryption algorithm " + encryptionAlgorithm
+                            + " is not compatible with key spec " + key.getKeySpec() + ".", 400);
+        }
     }
 
     /**

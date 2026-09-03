@@ -29,7 +29,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
+import java.security.spec.MGF1ParameterSpec;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -1192,6 +1198,212 @@ class KmsServiceTest {
         assertThrows(AwsException.class, () ->
                 kmsService.decrypt(v1Blob, Map.of("tenant", "1"), REGION));
         assertEquals(key.getArn(), kmsService.decryptToKeyArn(v1Blob, REGION));
+    }
+
+    // ─────────────────── Asymmetric (RSA OAEP) encrypt/decrypt ───────────────────
+
+    @ParameterizedTest
+    @CsvSource({
+        "RSA_2048, RSAES_OAEP_SHA_256",
+        "RSA_2048, RSAES_OAEP_SHA_1",
+        "RSA_3072, RSAES_OAEP_SHA_256",
+        "RSA_4096, RSAES_OAEP_SHA_1"
+    })
+    void rsaEncryptDecryptRoundTrip(String keySpec, String algorithm) {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", keySpec, null, Map.of(), REGION);
+        byte[] plaintext = "hello asymmetric".getBytes(StandardCharsets.UTF_8);
+
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(), plaintext, Map.of(), algorithm, REGION);
+
+        // Real RSA ciphertext: one modulus long, binary, not a floci blob envelope
+        assertEquals(Integer.parseInt(keySpec.substring(4)) / 8, ciphertext.length);
+        assertFalse(new String(ciphertext, StandardCharsets.UTF_8).startsWith("kms:"));
+
+        assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, Map.of(), algorithm, REGION));
+        // Algorithm can be omitted on Decrypt; floci falls back across the OAEP variants
+        assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, REGION));
+    }
+
+    @Test
+    void rsaEncryptDefaultsToOaepSha256() throws Exception {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] plaintext = "default algorithm".getBytes(StandardCharsets.UTF_8);
+
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(), plaintext, REGION);
+
+        // Standard JCA RSA OAEP SHA-256 must decrypt what floci encrypted when no
+        // EncryptionAlgorithm was supplied: floci output is real RSA ciphertext.
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPPadding");
+        cipher.init(Cipher.DECRYPT_MODE, privateKeyOf(key),
+                new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+        assertArrayEquals(plaintext, cipher.doFinal(ciphertext));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "RSAES_OAEP_SHA_256, SHA-256",
+        "RSAES_OAEP_SHA_1, SHA-1"
+    })
+    void externalPublicKeyEncryptionDecrypts(String algorithm, String oaepDigest) throws Exception {
+        // The core AWS interop contract: a client fetches the public key via GetPublicKey,
+        // encrypts locally, and floci Decrypt must recover the plaintext.
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] plaintext = "encrypted outside floci".getBytes(StandardCharsets.UTF_8);
+
+        PublicKey publicKey = rsaPublicKey(kmsService.getPublicKey(key.getKeyId(), REGION));
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey,
+                new OAEPParameterSpec(oaepDigest, "MGF1",
+                        "SHA-1".equals(oaepDigest) ? MGF1ParameterSpec.SHA1 : MGF1ParameterSpec.SHA256,
+                        PSource.PSpecified.DEFAULT));
+        byte[] ciphertext = cipher.doFinal(plaintext);
+
+        assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, Map.of(), algorithm, REGION));
+        assertArrayEquals(plaintext, kmsService.decrypt(ciphertext, Map.of(), null, REGION));
+    }
+
+    @Test
+    void externalPublicKeyEncryptionResolvesCorrectKeyAmongSeveral() throws Exception {
+        // No KeyId on Decrypt: floci must find the one RSA key whose private key unwraps it.
+        kmsService.createKey("decoy 2048", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        KmsKey key = kmsService.createKey("real 3072", "ENCRYPT_DECRYPT", "RSA_3072", null, Map.of(), REGION);
+        kmsService.createKey("sign only", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
+        byte[] plaintext = "pick me".getBytes(StandardCharsets.UTF_8);
+
+        Cipher cipher = Cipher.getInstance("RSA/ECB/OAEPPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, rsaPublicKey(kmsService.getPublicKey(key.getKeyId(), REGION)),
+                new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+        byte[] ciphertext = cipher.doFinal(plaintext);
+
+        KmsService.DecryptResult result =
+                kmsService.decryptAndResolveKey(ciphertext, Map.of(), null, REGION, null);
+        assertArrayEquals(plaintext, result.plaintext());
+        assertEquals(key.getArn(), result.keyArn());
+    }
+
+    @Test
+    void rsaDecryptWithEncryptionContextRoundTrips() throws Exception {
+        // AWS binds the EncryptionContext into RSA OAEP as the OAEP label (ASN.1 DER
+        // encoding of the context map), so decryption with a different context fails.
+        KmsKey key = kmsService.createKey("rsa ctx key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] plaintext = "context bound".getBytes(StandardCharsets.UTF_8);
+        Map<String, String> context = Map.of("tenant", "blue", "purpose", "test");
+
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(), plaintext, context, "RSAES_OAEP_SHA_256", REGION);
+
+        assertArrayEquals(plaintext,
+                kmsService.decrypt(ciphertext, context, "RSAES_OAEP_SHA_256", REGION));
+        // Context is order-independent, matching AWS
+        Map<String, String> reordered = new LinkedHashMap<>();
+        reordered.put("purpose", "test");
+        reordered.put("tenant", "blue");
+        assertArrayEquals(plaintext,
+                kmsService.decrypt(ciphertext, reordered, "RSAES_OAEP_SHA_256", REGION));
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.decrypt(ciphertext, Map.of("tenant", "blue"), "RSAES_OAEP_SHA_256", REGION));
+        assertEquals("InvalidCiphertextException", ex.getErrorCode());
+        assertThrows(AwsException.class, () ->
+                kmsService.decrypt(ciphertext, Map.of(), "RSAES_OAEP_SHA_256", REGION));
+    }
+
+    @Test
+    void rsaDecryptWithWrongAlgorithmFails() {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(),
+                "hello".getBytes(StandardCharsets.UTF_8), Map.of(), "RSAES_OAEP_SHA_256", REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.decrypt(ciphertext, Map.of(), "RSAES_OAEP_SHA_1", REGION));
+        assertEquals("InvalidCiphertextException", ex.getErrorCode());
+    }
+
+    @Test
+    void rsaDecryptWithWrongKeyIdThrowsIncorrectKey() {
+        KmsKey key = kmsService.createKey("rsa a", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        KmsKey other = kmsService.createKey("rsa b", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(),
+                "hello".getBytes(StandardCharsets.UTF_8), Map.of(), "RSAES_OAEP_SHA_256", REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.decryptAndResolveKey(ciphertext, Map.of(), "RSAES_OAEP_SHA_256",
+                        REGION, other.getKeyId()));
+        assertEquals("InvalidCiphertextException", ex.getErrorCode());
+
+        // But with the right KeyId the ARN comes back on the result
+        KmsService.DecryptResult result = kmsService.decryptAndResolveKey(
+                ciphertext, Map.of(), "RSAES_OAEP_SHA_256", REGION, key.getKeyId());
+        assertEquals(key.getArn(), result.keyArn());
+    }
+
+    @Test
+    void rsaEncryptWithInvalidAlgorithmThrows() {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.encrypt(key.getKeyId(), "x".getBytes(StandardCharsets.UTF_8),
+                        Map.of(), "SYMMETRIC_DEFAULT", REGION));
+        assertEquals("InvalidEncryptionAlgorithmException", ex.getErrorCode());
+    }
+
+    @Test
+    void symmetricEncryptWithRsaAlgorithmThrows() {
+        KmsKey key = kmsService.createKey("sym key", "ENCRYPT_DECRYPT", "SYMMETRIC_DEFAULT", null, Map.of(), REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.encrypt(key.getKeyId(), "x".getBytes(StandardCharsets.UTF_8),
+                        Map.of(), "RSAES_OAEP_SHA_256", REGION));
+        assertEquals("InvalidEncryptionAlgorithmException", ex.getErrorCode());
+    }
+
+    @Test
+    void encryptWithRsaSignVerifyKeyThrowsInvalidKeyUsage() {
+        KmsKey key = kmsService.createKey("rsa sign", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.encrypt(key.getKeyId(), "x".getBytes(StandardCharsets.UTF_8), REGION));
+        assertEquals("InvalidKeyUsageException", ex.getErrorCode());
+    }
+
+    @Test
+    void rsaDecryptWithGarbageCiphertextThrows() {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] garbage = new byte[256];
+        new java.util.Random(42).nextBytes(garbage);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.decrypt(garbage, Map.of(), "RSAES_OAEP_SHA_256", REGION));
+        assertEquals("InvalidCiphertextException", ex.getErrorCode());
+    }
+
+    @Test
+    void rsaEncryptRejectsOversizedPlaintext() {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        // 256-byte modulus, OAEP SHA-256 overhead 66 bytes -> 191 max
+        byte[] tooBig = new byte[256];
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kmsService.encrypt(key.getKeyId(), tooBig, Map.of(), "RSAES_OAEP_SHA_256", REGION));
+        assertEquals("ValidationException", ex.getErrorCode());
+    }
+
+    @Test
+    void decryptToKeyArnResolvesRsaCiphertext() {
+        KmsKey key = kmsService.createKey("rsa enc key", "ENCRYPT_DECRYPT", "RSA_2048", null, Map.of(), REGION);
+        byte[] ciphertext = kmsService.encrypt(key.getKeyId(),
+                "hello".getBytes(StandardCharsets.UTF_8), Map.of(), "RSAES_OAEP_SHA_256", REGION);
+
+        assertEquals(key.getArn(), kmsService.decryptToKeyArn(ciphertext, REGION));
+    }
+
+    private static PublicKey rsaPublicKey(KmsKey key) throws Exception {
+        return KeyFactory.getInstance("RSA").generatePublic(
+                new X509EncodedKeySpec(Base64.getDecoder().decode(key.getPublicKeyEncoded())));
+    }
+
+    private static java.security.PrivateKey privateKeyOf(KmsKey key) throws Exception {
+        return KeyFactory.getInstance("RSA").generatePrivate(
+                new java.security.spec.PKCS8EncodedKeySpec(Base64.getDecoder().decode(key.getPrivateKeyEncoded())));
     }
 
     @ParameterizedTest

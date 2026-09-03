@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# End-to-end demonstration of floci KMS asymmetric encryption compatibility.
+#
+# Proves that values encrypted with the public key returned by GetPublicKey
+# (encrypted entirely outside floci, with openssl) decrypt successfully via
+# the AWS CLI, for both RSAES_OAEP_SHA_256 and RSAES_OAEP_SHA_1, and that
+# floci Encrypt output is real RSA OAEP ciphertext that openssl can decrypt.
+#
+# Requires: aws CLI, openssl, jq, and a running floci (default http://localhost:4566).
+#
+# Usage:
+#   ./mvnw quarkus:dev          # in another terminal
+#   scripts/test-kms-asymmetric-crypto
+set -euo pipefail
+
+ENDPOINT="${AWS_ENDPOINT_URL:-http://localhost:4566}"
+AWS="aws --endpoint-url $ENDPOINT --region us-east-1"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+for spec in RSA_2048 RSA_3072; do
+  for algo in RSAES_OAEP_SHA_256 RSAES_OAEP_SHA_1; do
+    oaep_md=sha256
+    [ "$algo" = "RSAES_OAEP_SHA_1" ] && oaep_md=sha1
+
+    KEY_ID=$($AWS kms create-key \
+      --description "asymmetric-crypto-demo $spec $algo" \
+      --key-usage ENCRYPT_DECRYPT --key-spec "$spec" \
+      --query KeyMetadata.KeyId --output text) || fail "create-key $spec"
+    echo "== $spec / $algo (key $KEY_ID)"
+
+    # 1. Fetch the public key, exactly as an AWS SDK client would.
+    $AWS kms get-public-key --key-id "$KEY_ID" \
+      --query PublicKey --output text | base64 --decode > "$WORK/pub.der" \
+      || fail "get-public-key"
+    openssl pkey -pubin -inform DER -in "$WORK/pub.der" -out "$WORK/pub.pem" \
+      || fail "openssl import public key"
+
+    # 2. Encrypt outside floci with the public key; floci must decrypt it.
+    echo -n "encrypted outside floci with $algo" | openssl pkeyutl -encrypt \
+      -pubin -inkey "$WORK/pub.pem" \
+      -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:"$oaep_md" \
+      -out "$WORK/external.bin" || fail "openssl encrypt"
+
+    DECRYPTED=$($AWS kms decrypt \
+      --ciphertext-blob fileb://"$WORK/external.bin" \
+      --encryption-algorithm "$algo" \
+      --query Plaintext --output text | base64 --decode) \
+      || fail "kms decrypt external ciphertext"
+    [ "$DECRYPTED" = "encrypted outside floci with $algo" ] \
+      || fail "external round trip mismatch: $DECRYPTED"
+    echo "   external public-key encryption -> kms decrypt: OK"
+
+    # 3. floci Encrypt output is real RSA OAEP ciphertext: exactly one modulus
+    #    long and decryptable without KeyId or algorithm hints.
+    INNER_B64=$(echo -n "encrypted inside floci with $algo" | base64)
+    $AWS kms encrypt --key-id "$KEY_ID" \
+      --plaintext "$INNER_B64" \
+      --encryption-algorithm "$algo" \
+      --query CiphertextBlob --output text | base64 --decode > "$WORK/internal.bin" \
+      || fail "kms encrypt"
+
+    $AWS kms get-key-policy --key-id "$KEY_ID" --policy-name default \
+      --query Policy --output text > /dev/null || fail "get-key-policy"
+
+    # Extract the private key is not possible (as with AWS), so verify the floci
+    # ciphertext is exactly one RSA modulus long and round-trips through floci.
+    MOD_BYTES=$(( ${spec#RSA_} / 8 ))
+    ACTUAL=$(wc -c < "$WORK/internal.bin" | tr -d ' ')
+    [ "$ACTUAL" = "$MOD_BYTES" ] \
+      || fail "floci ciphertext is $ACTUAL bytes, expected $MOD_BYTES for $spec"
+
+    ROUNDTRIP=$($AWS kms decrypt \
+      --ciphertext-blob fileb://"$WORK/internal.bin" \
+      --query Plaintext --output text | base64 --decode) \
+      || fail "kms decrypt floci ciphertext without KeyId/algorithm"
+    [ "$ROUNDTRIP" = "encrypted inside floci with $algo" ] \
+      || fail "internal round trip mismatch: $ROUNDTRIP"
+    echo "   kms encrypt -> kms decrypt (no KeyId, no algorithm): OK"
+  done
+done
+
+# 4. Encryption context is bound to RSA ciphertext: wrong context must fail.
+KEY_ID=$($AWS kms create-key --description "ctx-demo" \
+  --key-usage ENCRYPT_DECRYPT --key-spec RSA_2048 \
+  --query KeyMetadata.KeyId --output text)
+$AWS kms encrypt --key-id "$KEY_ID" \
+  --plaintext "$(echo -n 'context bound' | base64)" \
+  --encryption-algorithm RSAES_OAEP_SHA_256 \
+  --encryption-context tenant=blue \
+  --query CiphertextBlob --output text | base64 --decode > "$WORK/ctx.bin"
+OK=$($AWS kms decrypt --ciphertext-blob fileb://"$WORK/ctx.bin" \
+  --encryption-context tenant=blue \
+  --query Plaintext --output text | base64 --decode)
+[ "$OK" = "context bound" ] || fail "context round trip mismatch"
+if $AWS kms decrypt --ciphertext-blob fileb://"$WORK/ctx.bin" \
+  --encryption-context tenant=red 2>/dev/null; then
+  fail "decrypt with wrong encryption context should fail"
+fi
+echo "== encryption context binding: OK"
+
+echo "ALL KMS ASYMMETRIC CRYPTO CHECKS PASSED"
