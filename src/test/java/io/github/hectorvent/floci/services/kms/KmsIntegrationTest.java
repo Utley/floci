@@ -167,6 +167,226 @@ class KmsIntegrationTest {
             .body("__type", equalTo("KMSInvalidMacException"));
     }
 
+    @ParameterizedTest
+    @CsvSource({
+        "RSA_2048, RSAES_OAEP_SHA_256",
+        "RSA_2048, RSAES_OAEP_SHA_1",
+        "RSA_3072, RSAES_OAEP_SHA_256",
+        "RSA_4096, RSAES_OAEP_SHA_256"
+    })
+    void rsaEncryptDecryptRoundTripThroughJsonHandler(String keySpec, String algorithm) {
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.CreateKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "Description": "integration-rsa-encrypt",
+                    "KeyUsage": "ENCRYPT_DECRYPT",
+                    "KeySpec": "%s"
+                }
+                """.formatted(keySpec))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("KeyMetadata.KeyId");
+
+        String plaintext = Base64.getEncoder().encodeToString(
+                "kms rsa round trip".getBytes(StandardCharsets.UTF_8));
+        var encryptResponse = given()
+            .header("X-Amz-Target", "TrentService.Encrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "KeyId": "%s",
+                    "Plaintext": "%s",
+                    "EncryptionAlgorithm": "%s"
+                }
+                """.formatted(keyId, plaintext, algorithm))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("KeyId", startsWith("arn:aws:kms:"))
+            .body("EncryptionAlgorithm", equalTo(algorithm))
+            .extract().jsonPath();
+
+        String ciphertext = encryptResponse.getString("CiphertextBlob");
+        byte[] ciphertextBytes = Base64.getDecoder().decode(ciphertext);
+        // Real RSA ciphertext: exactly one modulus long, not a floci blob envelope
+        assertEquals(Integer.parseInt(keySpec.substring(4)) / 8, ciphertextBytes.length);
+
+        given()
+            .header("X-Amz-Target", "TrentService.Decrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "KeyId": "%s",
+                    "CiphertextBlob": "%s",
+                    "EncryptionAlgorithm": "%s"
+                }
+                """.formatted(keyId, ciphertext, algorithm))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Plaintext", equalTo(plaintext))
+            .body("KeyId", startsWith("arn:aws:kms:"))
+            .body("EncryptionAlgorithm", equalTo(algorithm));
+    }
+
+    @Test
+    void decryptOfExternallyEncryptedRsaCiphertextThroughJsonHandler() throws Exception {
+        // The AWS interop contract: a client fetches the public key via GetPublicKey,
+        // encrypts locally with RSA OAEP, and floci Decrypt recovers the plaintext.
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.CreateKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "Description": "integration-rsa-external",
+                    "KeyUsage": "ENCRYPT_DECRYPT",
+                    "KeySpec": "RSA_2048"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("KeyMetadata.KeyId");
+
+        String publicKeyDer = given()
+            .header("X-Amz-Target", "TrentService.GetPublicKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "KeyId": "%s"
+                }
+                """.formatted(keyId))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("EncryptionAlgorithms", equalTo(List.of("RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256")))
+            .extract().jsonPath().getString("PublicKey");
+
+        java.security.PublicKey publicKey = java.security.KeyFactory.getInstance("RSA")
+                .generatePublic(new java.security.spec.X509EncodedKeySpec(
+                        Base64.getDecoder().decode(publicKeyDer)));
+        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("RSA/ECB/OAEPPadding");
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, publicKey,
+                new javax.crypto.spec.OAEPParameterSpec("SHA-256", "MGF1",
+                        java.security.spec.MGF1ParameterSpec.SHA256,
+                        javax.crypto.spec.PSource.PSpecified.DEFAULT));
+        String ciphertext = Base64.getEncoder().encodeToString(
+                cipher.doFinal("externally encrypted".getBytes(StandardCharsets.UTF_8)));
+
+        // No KeyId and no EncryptionAlgorithm on Decrypt, mirroring real AWS clients
+        given()
+            .header("X-Amz-Target", "TrentService.Decrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "CiphertextBlob": "%s"
+                }
+                """.formatted(ciphertext))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Plaintext", equalTo(Base64.getEncoder().encodeToString(
+                    "externally encrypted".getBytes(StandardCharsets.UTF_8))))
+            .body("KeyId", startsWith("arn:aws:kms:"));
+    }
+
+    @Test
+    void symmetricEncryptEchoesEncryptionAlgorithmThroughJsonHandler() {
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.CreateKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "Description": "integration-sym-encrypt"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("KeyMetadata.KeyId");
+
+        String plaintext = Base64.getEncoder().encodeToString(
+                "symmetric round trip".getBytes(StandardCharsets.UTF_8));
+        String ciphertext = given()
+            .header("X-Amz-Target", "TrentService.Encrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "KeyId": "%s",
+                    "Plaintext": "%s",
+                    "EncryptionAlgorithm": "SYMMETRIC_DEFAULT"
+                }
+                """.formatted(keyId, plaintext))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("EncryptionAlgorithm", equalTo("SYMMETRIC_DEFAULT"))
+            .extract().jsonPath().getString("CiphertextBlob");
+
+        given()
+            .header("X-Amz-Target", "TrentService.Decrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "CiphertextBlob": "%s",
+                    "EncryptionAlgorithm": "SYMMETRIC_DEFAULT"
+                }
+                """.formatted(ciphertext))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Plaintext", equalTo(plaintext))
+            .body("EncryptionAlgorithm", equalTo("SYMMETRIC_DEFAULT"));
+    }
+
+    @Test
+    void rsaEncryptWithWrongKeyUsageReturnsInvalidKeyUsage() {
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.CreateKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "Description": "integration-rsa-sign-only",
+                    "KeyUsage": "SIGN_VERIFY",
+                    "KeySpec": "RSA_2048"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("KeyMetadata.KeyId");
+
+        given()
+            .header("X-Amz-Target", "TrentService.Encrypt")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("""
+                {
+                    "KeyId": "%s",
+                    "Plaintext": "%s",
+                    "EncryptionAlgorithm": "RSAES_OAEP_SHA_256"
+                }
+                """.formatted(keyId,
+                    Base64.getEncoder().encodeToString("nope".getBytes(StandardCharsets.UTF_8))))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidKeyUsageException"));
+    }
+
     @Test
     void generateRandomReturnsBase64Plaintext() {
         // RED phase: This test is expected to fail until GenerateRandom is wired

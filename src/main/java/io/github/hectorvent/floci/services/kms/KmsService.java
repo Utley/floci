@@ -930,8 +930,9 @@ public class KmsService implements ResourceProvider {
      */
     private DecryptResult rsaDecryptAndResolveKey(byte[] ciphertext, Map<String, String> encryptionContext,
                                                   String encryptionAlgorithm, KmsKey candidate, String region) {
+        boolean keyPinned = candidate != null;
         List<KmsKey> candidates;
-        if (candidate != null) {
+        if (keyPinned) {
             validateRsaDecryptKey(candidate);
             candidates = List.of(candidate);
         } else {
@@ -963,7 +964,9 @@ public class KmsService implements ResourceProvider {
                 validateKeyIsUsableForCryptoOperations(key);
                 return new DecryptResult(plaintext, key.getArn());
             }
-            throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+            if (keyPinned) {
+                throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
+            }
         }
         throw new AwsException("InvalidCiphertextException", "The ciphertext is invalid.", 400);
     }
